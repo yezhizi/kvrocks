@@ -25,6 +25,9 @@
 #include "storage/redis_db.h"
 #include "storage/redis_metadata.h"
 #include "types/timeseries.h"
+namespace rocksdb {
+class Iterator;
+}
 
 namespace redis {
 
@@ -272,6 +275,13 @@ class TimeSeries : public SubKeyScanner {
                          AddResult *res);
 
  private:
+  struct ReadSpec {
+    rocksdb::ReadOptions read_options;
+    rocksdb::Slice lower_bound;
+    rocksdb::Slice upper_bound;
+    explicit ReadSpec(engine::Context &ctx);
+  };
+
   rocksdb::ColumnFamilyHandle *index_cf_handle_;
 
   rocksdb::Status getTimeSeriesMetadata(engine::Context &ctx, const Slice &ns_key, TimeSeriesMetadata *metadata);
@@ -304,7 +314,13 @@ class TimeSeries : public SubKeyScanner {
                                    std::vector<std::string> *user_keys, std::vector<LabelKVList> *labels_vec = nullptr,
                                    std::vector<TimeSeriesMetadata> *metas = nullptr);
 
-  std::string internalKeyFromChunkID(const Slice &ns_key, const TimeSeriesMetadata &metadata, uint64_t id) const;
+  // Get iterator to the last chunk whose max timestamp <= bound.
+  std::unique_ptr<rocksdb::Iterator> getIterForLastChunkBefore(engine::Context &ctx, const Slice &ns_key,
+                                                               const TimeSeriesMetadata &metadata, ReadSpec &read_spec,
+                                                               std::string &prefix, std::string &upper_bound,
+                                                               uint64_t seek_ts = TSSample::MAX_TIMESTAMP) const;
+  std::string internalKeyFromChunkID(const Slice &ns_key, const TimeSeriesMetadata &metadata, uint64_t id,
+                                     bool return_prefix = false) const;
   std::string internalKeyFromLabelKey(const Slice &ns_key, const TimeSeriesMetadata &metadata, Slice label_key) const;
   std::string internalKeyFromDownstreamKey(const Slice &ns_key, const TimeSeriesMetadata &metadata,
                                            Slice downstream_key) const;

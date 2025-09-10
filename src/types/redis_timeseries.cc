@@ -794,6 +794,12 @@ double TSAggregator::AggregateSamplesValue(nonstd::span<const TSSample> samples)
   return res;
 }
 
+TimeSeries::ReadSpec::ReadSpec(engine::Context &ctx) {
+  read_options = ctx.DefaultScanOptions();
+  read_options.iterate_lower_bound = &lower_bound;
+  read_options.iterate_upper_bound = &upper_bound;
+}
+
 rocksdb::Status TimeSeries::getTimeSeriesMetadata(engine::Context &ctx, const Slice &ns_key,
                                                   TimeSeriesMetadata *metadata) {
   return Database::GetMetadata(ctx, {kRedisTimeSeries}, ns_key, metadata);
@@ -831,23 +837,12 @@ rocksdb::Status TimeSeries::getOrCreateTimeSeries(engine::Context &ctx, const Sl
 rocksdb::Status TimeSeries::upsertCommon(engine::Context &ctx, const Slice &ns_key, TimeSeriesMetadata &metadata,
                                          SampleBatch &sample_batch, std::vector<std::string> *new_chunks) {
   auto all_batch_slice = sample_batch.AsSlice();
-
-  // In the emun `TSSubkeyType`, `LABEL` is the next of `CHUNK`
-  std::string chunk_upper_bound = internalKeyFromLabelKey(ns_key, metadata, "");
-  std::string end_key = internalKeyFromChunkID(ns_key, metadata, TSSample::MAX_TIMESTAMP);
-  std::string prefix = end_key.substr(0, end_key.size() - sizeof(uint64_t));
-
-  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
-  rocksdb::Slice upper_bound(chunk_upper_bound);
-  read_options.iterate_upper_bound = &upper_bound;
-  rocksdb::Slice lower_bound(prefix);
-  read_options.iterate_lower_bound = &lower_bound;
-
   uint64_t chunk_count = metadata.size;
 
   // Get the latest chunk
-  auto iter = util::UniqueIterator(ctx, read_options);
-  iter->SeekForPrev(end_key);
+  std::string prefix, upper_bound;
+  ReadSpec read_spec(ctx);
+  auto iter = getIterForLastChunkBefore(ctx, ns_key, metadata, read_spec, prefix, upper_bound);
   TSChunkPtr latest_chunk;
   std::string latest_chunk_key, latest_chunk_value;
   if (!iter->Valid() || !iter->key().starts_with(prefix)) {
@@ -958,24 +953,15 @@ rocksdb::Status TimeSeries::upsertCommon(engine::Context &ctx, const Slice &ns_k
 
 rocksdb::Status TimeSeries::rangeCommon(engine::Context &ctx, const Slice &ns_key, const TimeSeriesMetadata &metadata,
                                         const TSRangeOption &option, std::vector<TSSample> *res, bool apply_retention) {
+  res->clear();
   if (option.end_ts < option.start_ts) {
     return rocksdb::Status::OK();
   }
 
-  // In the emun `TSSubkeyType`, `LABEL` is the next of `CHUNK`
-  std::string chunk_upper_bound = internalKeyFromLabelKey(ns_key, metadata, "");
-  std::string end_key = internalKeyFromChunkID(ns_key, metadata, TSSample::MAX_TIMESTAMP);
-  std::string prefix = end_key.substr(0, end_key.size() - sizeof(uint64_t));
-
-  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
-  rocksdb::Slice upper_bound(chunk_upper_bound);
-  read_options.iterate_upper_bound = &upper_bound;
-  rocksdb::Slice lower_bound(prefix);
-  read_options.iterate_lower_bound = &lower_bound;
-
   // Get the latest chunk
-  auto iter = util::UniqueIterator(ctx, read_options);
-  iter->SeekForPrev(end_key);
+  std::string prefix, upper_bound;
+  ReadSpec read_spec(ctx);
+  auto iter = getIterForLastChunkBefore(ctx, ns_key, metadata, read_spec, prefix, upper_bound);
   if (!iter->Valid() || !iter->key().starts_with(prefix)) {
     return rocksdb::Status::OK();
   }
@@ -991,11 +977,10 @@ rocksdb::Status TimeSeries::rangeCommon(engine::Context &ctx, const Slice &ns_ke
   // Update iterator options
   auto start_key = internalKeyFromChunkID(ns_key, metadata, start_timestamp);
   if (end_timestamp != TSSample::MAX_TIMESTAMP) {
-    end_key = internalKeyFromChunkID(ns_key, metadata, end_timestamp + 1);
+    upper_bound = internalKeyFromChunkID(ns_key, metadata, end_timestamp + 1);
   }
-  upper_bound = Slice(end_key);
-  read_options.iterate_upper_bound = &upper_bound;
-  iter = util::UniqueIterator(ctx, read_options);
+  read_spec.upper_bound = upper_bound;
+  iter = util::UniqueIterator(ctx, read_spec.read_options);
 
   iter->SeekForPrev(start_key);
   if (!iter->Valid()) {
@@ -1275,20 +1260,9 @@ rocksdb::Status TimeSeries::upsertDownStream(engine::Context &ctx, const Slice &
 
 rocksdb::Status TimeSeries::getCommon(engine::Context &ctx, const Slice &ns_key, const TimeSeriesMetadata &metadata,
                                       bool is_return_latest, std::vector<TSSample> *res) {
-  // In the emun `TSSubkeyType`, `LABEL` is the next of `CHUNK`
-  std::string chunk_upper_bound = internalKeyFromLabelKey(ns_key, metadata, "");
-  std::string end_key = internalKeyFromChunkID(ns_key, metadata, TSSample::MAX_TIMESTAMP);
-  std::string prefix = end_key.substr(0, end_key.size() - sizeof(uint64_t));
-
-  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
-  rocksdb::Slice upper_bound(chunk_upper_bound);
-  read_options.iterate_upper_bound = &upper_bound;
-  rocksdb::Slice lower_bound(prefix);
-  read_options.iterate_lower_bound = &lower_bound;
-
-  // Get the latest chunk
-  auto iter = util::UniqueIterator(ctx, read_options);
-  iter->SeekForPrev(end_key);
+  std::string prefix, upper_bound;
+  ReadSpec read_spec(ctx);
+  auto iter = getIterForLastChunkBefore(ctx, ns_key, metadata, read_spec, prefix, upper_bound);
   if (!iter->Valid() || !iter->key().starts_with(prefix)) {
     return rocksdb::Status::OK();
   }
@@ -1300,6 +1274,7 @@ rocksdb::Status TimeSeries::getCommon(engine::Context &ctx, const Slice &ns_key,
   res->push_back(chunk->GetLatestSample(0));
   return rocksdb::Status::OK();
 }
+
 
 rocksdb::Status TimeSeries::createLabelIndexInBatch(const Slice &ns_key, const TimeSeriesMetadata &metadata,
                                                     ObserverOrUniquePtr<rocksdb::WriteBatchBase> &batch,
@@ -1464,11 +1439,33 @@ rocksdb::Status TimeSeries::getTSKeyByFilter(engine::Context &ctx, const TSMGetO
   return rocksdb::Status::OK();
 }
 
-std::string TimeSeries::internalKeyFromChunkID(const Slice &ns_key, const TimeSeriesMetadata &metadata,
-                                               uint64_t id) const {
+std::unique_ptr<rocksdb::Iterator> TimeSeries::getIterForLastChunkBefore(engine::Context &ctx, const Slice &ns_key,
+                                                                         const TimeSeriesMetadata &metadata,
+                                                                         ReadSpec &read_spec, std::string &prefix,
+                                                                         std::string &upper_bound,
+                                                                         uint64_t seek_ts) const {
+  // In the emun `TSSubkeyType`, `LABEL` is the next of `CHUNK`
+  upper_bound = internalKeyFromLabelKey(ns_key, metadata, "");
+  prefix = internalKeyFromChunkID(ns_key, metadata, 0, true);
+
+  read_spec.lower_bound = prefix;
+  read_spec.upper_bound = upper_bound;
+
+  // Get the latest chunk
+  auto iter = util::UniqueIterator(ctx, read_spec.read_options);
+  auto end_key = internalKeyFromChunkID(ns_key, metadata, seek_ts);
+  iter->SeekForPrev(end_key);
+
+  return std::move(iter);
+}
+
+std::string TimeSeries::internalKeyFromChunkID(const Slice &ns_key, const TimeSeriesMetadata &metadata, uint64_t id,
+                                               bool return_prefix) const {
   std::string sub_key;
   PutFixed8(&sub_key, static_cast<uint8_t>(TSSubkeyType::CHUNK));
-  PutFixed64(&sub_key, id);
+  if (!return_prefix) {
+    PutFixed64(&sub_key, id);
+  }
 
   return InternalKey(ns_key, sub_key, metadata.version, storage_->IsSlotIdEncoded()).Encode();
 }
@@ -1577,18 +1574,9 @@ rocksdb::Status TimeSeries::Info(engine::Context &ctx, const Slice &user_key, TS
   // TODO: Estimate disk usage for the field `memoryUsage`
   res->memory_usage = 0;
   // Retrieve the first and last timestamp
-  std::string chunk_upper_bound = internalKeyFromLabelKey(ns_key, metadata, "");
-  std::string end_key = internalKeyFromChunkID(ns_key, metadata, TSSample::MAX_TIMESTAMP);
-  std::string prefix = end_key.substr(0, end_key.size() - sizeof(uint64_t));
-
-  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
-  rocksdb::Slice upper_bound(chunk_upper_bound);
-  read_options.iterate_upper_bound = &upper_bound;
-  rocksdb::Slice lower_bound(prefix);
-  read_options.iterate_lower_bound = &lower_bound;
-
-  auto iter = util::UniqueIterator(ctx, read_options);
-  iter->SeekForPrev(end_key);
+  std::string prefix, upper_bound;
+  ReadSpec read_spec(ctx);
+  auto iter = getIterForLastChunkBefore(ctx, ns_key, metadata, read_spec, prefix, upper_bound);
   if (!iter->Valid() || !iter->key().starts_with(prefix)) {
     // no chunk
     res->first_timestamp = 0;
